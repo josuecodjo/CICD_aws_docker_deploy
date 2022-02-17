@@ -1,0 +1,279 @@
+---
+AWSTemplateFormatVersion: 2010-09-09
+
+Description: Stack to deploy a highly available, elastic, scalable fagate environment. This master stack launches multiple nested stacks for different tiers. !! This can only be run in certain AWS Regions - 'us-east-1'.
+
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+    - Label:
+        default: General AWS
+      Parameters:
+        - Environment
+    - Label:
+        default: Network
+      Parameters:
+        - VpcName
+        - myVPCIDCIDRRange
+        - PublicSubnetCIDRRange1
+        - PublicSubnetCIDRRange2
+    - Label:
+        default: ECS cluster and Task definition ALB
+      Parameters:
+        - accountID
+        - containerPort
+        - containerName
+        - ecsClusterName
+        - imageName
+
+Parameters:
+  VpcName:
+    Description: Name your VPC
+    Type: String
+  myVPCIDCIDRRange:
+    Description: The IP address range for your new VPC.
+    Type: String
+    MinLength: '9'
+    MaxLength: '18'
+    Default: 10.0.0.0/16
+    AllowedPattern: '(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})/(\d{1,2})'
+    ConstraintDescription: must be a valid IP CIDR range of the form x.x.x.x/x.
+  PublicSubnetCIDRRange1:
+    Description: The IP address range for a subnet in myVPC.
+    Type: String
+    MinLength: '9'
+    MaxLength: '18'
+    Default: 10.0.0.0/24
+    AllowedPattern: '(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})/(\d{1,2})'
+    ConstraintDescription: must be a valid IP CIDR range of the form x.x.x.x/x.
+  PublicSubnetCIDRRange2:
+    Description: The IP address range for a subnet in myVPC.
+    Type: String
+    MinLength: '9'
+    MaxLength: '18'
+    Default: 10.0.1.0/24
+    AllowedPattern: '(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})/(\d{1,2})'
+    ConstraintDescription: must be a valid IP CIDR range of the form x.x.x.x/x.
+  containerName:
+    ConstraintDescription: Must be a valid Description
+    AllowedPattern: "[a-zA-Z0-9]*"
+    Description: Container name
+    MaxLength: 20
+    Type: String
+  containerPort:
+    ConstraintDescription: Must be a valid Description
+    Description: Container Port
+    MaxValue: 61585
+    MinValue: 0
+    Type: Number
+  accountID:
+    ConstraintDescription: Must be a valid Description
+    AllowedPattern: "[a-zA-Z0-9]*"
+    Description: AWS account ID
+    MaxLength: 30
+    Type: String
+  ecsClusterName:
+    ConstraintDescription: Must be a valid Description
+    AllowedPattern: "[a-zA-Z0-9]*"
+    Description: ECS Cluster Name
+    MaxLength: 30
+    Type: String
+  imageName:
+    Description: Image Name example <replace with account ID>.dkr.ecr.eu-west-3.amazonaws.com/myapp:latest
+    MaxLength: 500
+    Type: String
+  Environment:
+    ConstraintDescription: Must be a valid Description
+    AllowedPattern: "[a-zA-Z0-9]*"
+    Description: Environment
+    MaxLength: 30
+    Type: String
+
+
+
+Resources:
+  myVPC:
+    Type: 'AWS::EC2::VPC'
+    Properties:
+      CidrBlock: !Ref 'myVPCIDCIDRRange'
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      InstanceTenancy: default
+      Tags: 
+        - Key: Name
+          Value: !Ref 'VpcName'
+  PublicSubnet1:
+    Type: 'AWS::EC2::Subnet'
+    Properties:
+      CidrBlock: !Ref 'PublicSubnetCIDRRange1'
+      AvailabilityZone: "us-east-1a"
+      VpcId: !Ref myVPC
+      Tags: 
+        - Key: Name
+          Value: !Join [ "-", [!Ref 'VpcName', "Subnet1"] ]
+  PublicSubnet2:
+    Type: 'AWS::EC2::Subnet'
+    Properties:
+      CidrBlock: !Ref 'PublicSubnetCIDRRange2'
+      AvailabilityZone: "us-east-1b"
+      VpcId: !Ref myVPC
+      Tags: 
+        - Key: Name
+          Value: !Join [ "-", [!Ref 'VpcName', "Subnet2"] ]
+  myInternetGateway: 
+    Type: 'AWS::EC2::InternetGateway'
+    Properties:
+      Tags: 
+        - Key: Name
+          Value: !Join [ "-", [!Sub 'VpcName', "IGW"] ]
+  AttachGateway:
+    Type: 'AWS::EC2::VPCGatewayAttachment'
+    Properties:
+      VpcId: !Ref myVPC
+      InternetGatewayId: !Ref myInternetGateway
+  PublicRouteTable:
+    Type: 'AWS::EC2::RouteTable'
+    Properties:
+      VpcId: !Ref myVPC
+  PublicRoute:
+    Type: 'AWS::EC2::Route'
+    DependsOn: AttachGateway
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref myInternetGateway
+  PublicSubnetRouteTableAssociation1:
+    Type: 'AWS::EC2::SubnetRouteTableAssociation'
+    Properties:
+      SubnetId: !Ref PublicSubnet1
+      RouteTableId: !Ref PublicRouteTable
+  PublicSubnetRouteTableAssociation2:
+    Type: 'AWS::EC2::SubnetRouteTableAssociation'
+    Properties:
+      SubnetId: !Ref PublicSubnet2
+      RouteTableId: !Ref PublicRouteTable
+  MyTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      RequiresCompatibilities:
+        - "FARGATE"
+      ExecutionRoleArn: !Join [ ":", ["arn:aws:iam:", !Ref 'accountID', "role/ecsTaskExecutionRole"] ]
+      Cpu: 256
+      Memory: 512
+      NetworkMode: "awsvpc"
+      ContainerDefinitions:
+        - Name: !Ref 'containerName'
+          Image: !Ref 'imageName'
+          MemoryReservation: 256
+          Memory: 512
+          PortMappings:
+            - ContainerPort: !Ref containerPort
+              Protocol: tcp
+  ECSCluster:
+    Type: 'AWS::ECS::Cluster'
+    Properties:
+      ClusterName: !Join [ "-", [!Ref 'Environment', "MyFargateCluster"] ]
+  FargateAlb:
+    Type: 'AWS::ElasticLoadBalancingV2::LoadBalancer'
+    Properties:
+      Name: !Join [ "-", [!Ref 'Environment', "FargateAlb"] ]
+      Subnets:
+        - !Ref PublicSubnet1
+        - !Ref PublicSubnet2
+      Type: application
+      SecurityGroups:
+        - !GetAtt FargateAlbSG.GroupId
+    DependsOn: 
+      - myVPC
+      - PublicSubnet1
+      - PublicSubnet2
+  MyFargateTargetGroup:
+    Type: 'AWS::ElasticLoadBalancingV2::TargetGroup'
+    Properties:
+      Name: !Join [ "-", [!Ref 'Environment', "MyFargateTargetGroup"] ]
+      VpcId: !Ref myVPC
+      Protocol: HTTP
+      Port: !Ref containerPort
+      HealthCheckPath: /actuator/
+      TargetType: ip
+    DependsOn: 
+      - myVPC
+      - PublicSubnet1
+      - PublicSubnet2
+  Listener:
+    Type: 'AWS::ElasticLoadBalancingV2::Listener'
+    Properties:
+      DefaultActions:
+        - TargetGroupArn: !Ref MyFargateTargetGroup
+          Type: forward
+      LoadBalancerArn: !Ref FargateAlb
+      Port: 80
+      Protocol: HTTP
+    DependsOn: 
+      - myVPC
+      - PublicSubnet1
+      - PublicSubnet2
+  FargateAlbSG:
+    Type: 'AWS::EC2::SecurityGroup'
+    Properties:
+      GroupDescription: SG for the Fargate ALB
+      GroupName: !Join [ "-", [!Ref 'Environment', "FargateAlbSG"] ]
+      VpcId: !Ref myVPC
+      SecurityGroupIngress:
+        - CidrIpv6: ::/0
+          FromPort: 80
+          ToPort: 80
+          IpProtocol: TCP
+          Description: 'Inbound rule for IPv6 traffic'
+        - CidrIp: 0.0.0.0/0
+          FromPort: 80
+          ToPort: 80
+          IpProtocol: TCP
+          Description: 'Inbound rule for IPv4 traffic'
+    DependsOn: 
+      - myVPC
+      - PublicSubnet1
+      - PublicSubnet2
+  Alb2FargateContainers:
+    Type: 'AWS::EC2::SecurityGroup'
+    Properties:
+      GroupDescription: SG for traffic between ALB and containers
+      GroupName: !Join [ "-", [!Ref 'Environment', "Alb2FargateContainers"] ]
+      VpcId: !Ref myVPC
+      SecurityGroupIngress:
+        - IpProtocol: -1
+          SourceSecurityGroupId: !GetAtt FargateAlbSG.GroupId
+          Description: 'Inbound rule for all traffic'
+    DependsOn: 
+      - myVPC
+      - PublicSubnet1
+      - PublicSubnet2
+  MyECSService:
+    Type: AWS::ECS::Service
+    DependsOn:
+      - Listener
+      - myVPC
+      - PublicSubnet1
+      - PublicSubnet2
+    Properties:
+      LaunchType: FARGATE
+      Cluster:
+        Ref: "ECSCluster"
+      DesiredCount: 2
+      TaskDefinition:
+        Ref: "MyTaskDefinition"
+      DeploymentConfiguration:
+        MaximumPercent: 100
+        MinimumHealthyPercent: 0
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: ENABLED
+          SecurityGroups:
+            - !GetAtt Alb2FargateContainers.GroupId
+          Subnets: [!Ref PublicSubnet1,!Ref PublicSubnet2]
+      LoadBalancers:
+        - TargetGroupArn:
+            Ref: MyFargateTargetGroup
+          ContainerPort: !Ref containerPort
+          ContainerName: !Ref containerName

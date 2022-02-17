@@ -1,0 +1,263 @@
+stages:
+  - .pre
+  - build
+  - smoketest
+  - package
+  - promote
+  - infra
+  - destroy
+
+variables:
+  STACK_NAME: josh-test
+  BUCKET_NAME: josh-test-s3
+  REGION: us-east-1
+  APP: myapp
+  ACCOUNT_ID: *************
+  StageImageRepositoryUrl: $ACCOUNT_ID.dkr.ecr.us-east-1.amazonaws.com/$APP
+  ImageTag: latest
+  DOCKER_HOST: tcp://docker:2375
+  DOCKER_DRIVER: overlay2
+  DOCKER_TLS_CERTDIR: ""
+  imageName: $ACCOUNT_ID.dkr.ecr.us-east-1.amazonaws.com/$APP:$ImageTag
+  containerPort: 8080
+
+# run on branch push, but not tags
+workflow:
+  rules:
+    - if: $CI_COMMIT_BRANCH
+
+getCredentials:
+  stage: .pre
+  image: registry.gitlab.com/gitlab-org/cloud-deploy/aws-base:latest
+  interruptible: true
+  only:
+    - branches
+  script:
+    - aws --region $REGION ecr get-login-password > credentials
+  artifacts:
+    paths:
+      - credentials
+
+validate:
+  stage: .pre
+  image: registry.gitlab.com/gitlab-org/cloud-deploy/aws-base:latest
+  script:
+    - echo "Validating template for ${STACK_NAME}"
+    - cd cfn
+    - ./check_temp.sh
+
+checkstack:
+  stage: .pre
+  image: registry.gitlab.com/gitlab-org/cloud-deploy/aws-base:latest
+  script:
+    - echo "Checking if ${STACK_NAME} exists"
+    - export STACKEXISTS=true
+    - aws cloudformation describe-stacks | grep $STACK_NAME || export STACKEXISTS=false
+    - echo "Stack exists? $STACKEXISTS"
+    - echo "STACKEXISTS=${STACKEXISTS}" > build.env
+  artifacts:
+    reports:
+      dotenv: build.env
+
+publish:
+  stage: .pre
+  rules:
+    - if: $CI_COMMIT_BRANCH == 'main' 
+  image: registry.gitlab.com/gitlab-org/cloud-deploy/aws-base:latest
+  script:
+    - aws s3api create-bucket --bucket ${BUCKET_NAME} --region $REGION || echo "Bucket exists"
+    - echo "Publishing template to ${S3URI}"
+    - aws s3 sync cfn/templates/ s3://${BUCKET_NAME}
+  artifacts:
+    reports:
+      dotenv: build.env
+
+plan:
+  stage: .pre
+  rules:
+    - if: $CI_COMMIT_BRANCH == 'main' 
+  image: registry.gitlab.com/gitlab-org/cloud-deploy/aws-base:latest
+  script:
+    - export CHANGESETNAME="${STACK_NAME}-${CI_COMMIT_BRANCH}-${BUILD_DATE}"
+    - export S3URI="https://${BUCKET_NAME}.s3.${REGION}.amazonaws.com/master.yaml"
+    - echo "STACKEXISTS=${STACKEXISTS}" > build.env
+    - echo "CHANGESETNAME=${CHANGESETNAME}" >> build.env
+    - echo "BUILD_DATE=${BUILD_DATE}" >> build.env
+    - echo "S3URI=${S3URI}" >> build.env
+    - >
+      if [ "$STACKEXISTS" == "true" ]; then
+        CHANGESETID=$(aws cloudformation create-change-set \
+        --stack-name $STACK_NAME \
+        --change-set-name $CHANGESETNAME \
+        --template-url $S3URI \
+        --parameters ParameterKey=VpcName,ParameterValue=$CI_COMMIT_BRANCH \
+        --query 'Id') 
+        echo $CHANGESETID
+        aws cloudformation describe-change-set \
+        --change-set-name $CHANGESETNAME \
+        --stack-name $STACK_NAME
+      else
+        echo "${STACK_NAME} does not exist, need to create it..."
+      fi  
+  dependencies:
+    - publish
+  artifacts:
+    reports:
+      dotenv: build.env
+
+
+build:
+  stage: build
+  image: python:3.8-alpine
+  interruptible: true
+  only:
+    - branches
+  script:
+    - cd cfn/app
+    - pip install -r requirements.txt
+
+smoketest:
+  image: docker:latest
+  interruptible: true
+  only:
+    - branches
+  stage: smoketest
+  services:
+    - docker:19-dind
+  script:
+    - apk add curl
+    - cd cfn/
+    - docker build -t "test:$ImageTag" .
+    - docker run -d -p $containerPort:$containerPort  --rm --name web-test test:$ImageTag
+    - sleep 15
+    - curl docker:$containerPort
+  after_script:
+    - docker rm -f web-test
+  resource_group: staging  
+
+
+package:
+  image: docker:latest
+  interruptible: true
+  only:
+    - branches
+  stage: package
+  services:
+    - docker:19-dind
+  before_script:
+    - apk add --no-cache curl jq python3 py3-pip
+    - pip install awscli
+    - aws --version
+    - docker --version
+    - aws ecr create-repository --repository-name $APP || echo "repository already exists"
+    - aws --region $REGION ecr get-login-password | docker login -u AWS --password-stdin $StageImageRepositoryUrl
+  script:
+    - cd cfn/
+    - docker build --pull -t "$StageImageRepositoryUrl:$ImageTag" .
+    - docker push "$StageImageRepositoryUrl:$ImageTag"
+  artifacts:
+    paths:
+      - credentials
+  resource_group: staging    
+
+
+.deployInfra:
+  stage: promote
+  image: registry.gitlab.com/gitlab-org/cloud-deploy/aws-base:latest
+  rules:
+    - if: $CI_COMMIT_BRANCH == 'main' || $CI_COMMIT_BRANCH == 'develop'  
+      when: manual
+  script:
+    - >
+      if [ "$STACKEXISTS" == "true" ]; then
+        echo "Applying ${CHANGESETNAME}" &&
+        aws cloudformation execute-change-set \
+        --change-set-name $CHANGESETNAME \
+        --stack-name $STACK_NAME-$Stage
+      else
+        echo "Creating ${STACK_NAME} for $Stage" &&
+        aws iam create-role \
+          --role-name ecsTaskExecutionRole \
+          --assume-role-policy-document file://cfn/role/ecs-tasks-trust-policy.json || echo "true" &&
+        aws iam attach-role-policy \
+          --role-name ecsTaskExecutionRole \
+          --policy-arn arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy || echo "true" &&
+        aws cloudformation create-stack  \
+          --stack-name $STACK_NAME-$Stage  \
+          --template-body file://cfn/templates/master.yml \
+          --parameters \
+          "ParameterKey=VpcName,ParameterValue=$Stage" \
+          "ParameterKey=Environment,ParameterValue=$Stage" \
+          "ParameterKey=accountID,ParameterValue=$ACCOUNT_ID" \
+          "ParameterKey=containerPort,ParameterValue=$containerPort" "ParameterKey=containerName,ParameterValue=$APP" \
+          "ParameterKey=ecsClusterName,ParameterValue=$Stage" \
+          "ParameterKey=imageName,ParameterValue=$imageName" || echo "stack exists"
+      fi 
+    - echo "Well done :-)"
+
+
+deployInfraStaging:
+  extends: .deployInfra
+  variables:
+    Stage: stage
+  resource_group: staging
+
+deployInfraProduction:
+  extends: .deployInfra
+  variables:
+    Stage: prod
+  resource_group: production
+
+.checkInfra:
+  stage: infra
+  image: registry.gitlab.com/gitlab-org/cloud-deploy/aws-base:latest
+  rules:
+    - if: $CI_COMMIT_BRANCH == 'main' || $CI_COMMIT_BRANCH == 'develop'  
+      when: manual
+  script:
+    - aws cloudformation list-stacks  --stack-status-filter CREATE_COMPLETE | grep $STACK_NAME-$Stage
+
+checkInfraStaging:
+  extends: .checkInfra
+  variables:
+    Stage: stage
+  resource_group: staging
+
+checkInfraProduction:
+  extends: .checkInfra
+  variables:
+    Stage: prod
+  resource_group: production
+
+
+.destroyInfra:
+  stage: destroy
+  image: registry.gitlab.com/gitlab-org/cloud-deploy/aws-base:latest
+  rules:
+    - if: $CI_COMMIT_BRANCH == 'main' || $CI_COMMIT_BRANCH == 'develop' || $CI_COMMIT_BRANCH == 'deploy-stack'
+      when: manual
+  script:
+    - >
+      if [ "$STACKEXISTS" == "true" ]; then
+        echo "Applying ${CHANGESETNAME}" &&
+        aws cloudformation execute-change-set \
+        --change-set-name $CHANGESETNAME \
+        --stack-name $STACK_NAME-$Stage
+      else
+        echo "Deleting ${STACK_NAME} for $Stage" &&
+        aws cloudformation delete-stack  \
+          --stack-name $STACK_NAME-$Stage || echo "stack already deleted"
+      fi 
+    - echo "Well done :-)"
+
+destroyInfraStaging:
+  extends: .destroyInfra
+  variables:
+    Stage: stage
+  resource_group: staging
+
+destroyInfraProduction:
+  extends: .destroyInfra
+  variables:
+    Stage: prod
+  resource_group: production
